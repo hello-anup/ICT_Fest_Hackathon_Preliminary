@@ -1,6 +1,7 @@
 """Authentication endpoints: register, login, refresh, logout."""
 
 from fastapi import APIRouter, Depends
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import (
@@ -9,6 +10,7 @@ from ..auth import (
     decode_token,
     get_token_payload,
     hash_password,
+    is_refresh_token_used,
     revoke_access_token,
     revoke_refresh_token,
     verify_password,
@@ -16,7 +18,12 @@ from ..auth import (
 from ..database import get_db
 from ..errors import AppError
 from ..models import Organization, User
-from ..schemas import LoginRequest, RefreshRequest, RegisterRequest
+from ..schemas import (
+    LoginRequest,
+    RefreshRequest,
+    RegisterRequest,
+)
+
 
 router = APIRouter(
     prefix="/auth",
@@ -24,31 +31,60 @@ router = APIRouter(
 )
 
 
-@router.post("/register", status_code=201)
+@router.post(
+    "/register",
+    status_code=201,
+)
 def register(
     payload: RegisterRequest,
     db: Session = Depends(get_db),
 ):
     org = (
         db.query(Organization)
-        .filter(Organization.name == payload.org_name)
+        .filter(
+            Organization.name
+            == payload.org_name,
+        )
         .first()
     )
 
+    role = "member"
+
     if org is None:
-        org = Organization(name=payload.org_name)
+        org = Organization(
+            name=payload.org_name,
+        )
+
         db.add(org)
-        db.commit()
-        db.refresh(org)
-        role = "admin"
-    else:
-        role = "member"
+
+        try:
+            db.commit()
+            db.refresh(org)
+
+        except IntegrityError:
+            db.rollback()
+
+            org = (
+                db.query(Organization)
+                .filter(
+                    Organization.name
+                    == payload.org_name,
+                )
+                .first()
+            )
+
+            if org is None:
+                raise
+
+        else:
+            role = "admin"
 
     existing = (
         db.query(User)
         .filter(
             User.org_id == org.id,
-            User.username == payload.username,
+            User.username
+            == payload.username,
         )
         .first()
     )
@@ -63,13 +99,26 @@ def register(
     user = User(
         org_id=org.id,
         username=payload.username,
-        hashed_password=hash_password(payload.password),
+        hashed_password=hash_password(
+            payload.password,
+        ),
         role=role,
     )
 
     db.add(user)
-    db.commit()
-    db.refresh(user)
+
+    try:
+        db.commit()
+        db.refresh(user)
+
+    except IntegrityError:
+        db.rollback()
+
+        raise AppError(
+            409,
+            "USERNAME_TAKEN",
+            "Username already exists",
+        )
 
     return {
         "user_id": user.id,
@@ -86,7 +135,10 @@ def login(
 ):
     org = (
         db.query(Organization)
-        .filter(Organization.name == payload.org_name)
+        .filter(
+            Organization.name
+            == payload.org_name,
+        )
         .first()
     )
 
@@ -97,7 +149,8 @@ def login(
             db.query(User)
             .filter(
                 User.org_id == org.id,
-                User.username == payload.username,
+                User.username
+                == payload.username,
             )
             .first()
         )
@@ -116,8 +169,10 @@ def login(
         )
 
     return {
-        "access_token": create_access_token(user),
-        "refresh_token": create_refresh_token(user),
+        "access_token":
+            create_access_token(user),
+        "refresh_token":
+            create_refresh_token(user),
         "token_type": "bearer",
     }
 
@@ -127,7 +182,9 @@ def refresh(
     payload: RefreshRequest,
     db: Session = Depends(get_db),
 ):
-    data = decode_token(payload.refresh_token)
+    data = decode_token(
+        payload.refresh_token,
+    )
 
     if data.get("type") != "refresh":
         raise AppError(
@@ -136,13 +193,33 @@ def refresh(
             "Wrong token type",
         )
 
-    revoke_refresh_token(data)
+    if is_refresh_token_used(data):
+        raise AppError(
+            401,
+            "UNAUTHORIZED",
+            "Refresh token already used",
+        )
+
+    try:
+        user_id = int(
+            data["sub"]
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise AppError(
+            401,
+            "UNAUTHORIZED",
+            "Invalid token payload",
+        )
 
     user = (
         db.query(User)
         .filter(
-            User.id == int(data["sub"]),
-            User.org_id == int(data["org"]),
+            User.id == user_id,
         )
         .first()
     )
@@ -154,18 +231,38 @@ def refresh(
             "Unknown user",
         )
 
+    if (
+        data.get("org")
+        != user.org_id
+        or data.get("role")
+        != user.role
+    ):
+        raise AppError(
+            401,
+            "UNAUTHORIZED",
+            "Invalid token payload",
+        )
+
+    revoke_refresh_token(data)
+
     return {
-        "access_token": create_access_token(user),
-        "refresh_token": create_refresh_token(user),
+        "access_token":
+            create_access_token(user),
+        "refresh_token":
+            create_refresh_token(user),
         "token_type": "bearer",
     }
 
 
 @router.post("/logout")
 def logout(
-    payload: dict = Depends(get_token_payload),
+    payload: dict = Depends(
+        get_token_payload
+    ),
 ):
-    revoke_access_token(payload)
+    revoke_access_token(
+        payload,
+    )
 
     return {
         "status": "ok",

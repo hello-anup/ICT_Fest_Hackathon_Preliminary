@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import jwt
 from fastapi import Depends, Request
@@ -24,122 +24,175 @@ _PBKDF2_ROUNDS = 100_000
 
 def hash_password(password: str) -> str:
     salt = os.urandom(16)
-    dk = hashlib.pbkdf2_hmac(
+
+    password_hash = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode(),
         salt,
-        _PBKDF2_ROUNDS
+        _PBKDF2_ROUNDS,
     )
-    return f"{salt.hex()}:{dk.hex()}"
+
+    return f"{salt.hex()}:{password_hash.hex()}"
 
 
-def verify_password(password: str, stored: str) -> bool:
+def verify_password(
+    password: str,
+    stored: str,
+) -> bool:
     try:
-        salt_hex, hash_hex = stored.split(":")
-    except ValueError:
+        salt_hex, hash_hex = stored.split(":", 1)
+
+        salt = bytes.fromhex(salt_hex)
+
+    except (ValueError, TypeError):
         return False
 
     new_hash = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode(),
-        bytes.fromhex(salt_hex),
-        _PBKDF2_ROUNDS
+        salt,
+        _PBKDF2_ROUNDS,
     )
 
     return hmac.compare_digest(
         new_hash.hex(),
-        hash_hex
+        hash_hex,
     )
 
 
-def _now_ts():
-    return int(datetime.now(timezone.utc).timestamp())
+def _now_ts() -> int:
+    return int(
+        datetime.now(
+            timezone.utc,
+        ).timestamp()
+    )
 
 
-def _create_token(user: User, token_type: str, seconds: int):
-
-    iat = _now_ts()
+def _create_token(
+    user: User,
+    token_type: str,
+    lifetime_seconds: int,
+) -> str:
+    issued_at = _now_ts()
 
     payload = {
         "sub": str(user.id),
         "org": user.org_id,
         "role": user.role,
         "jti": uuid.uuid4().hex,
-        "iat": iat,
-        "exp": iat + seconds,
+        "iat": issued_at,
+        "exp": issued_at + lifetime_seconds,
         "type": token_type,
     }
 
     return jwt.encode(
         payload,
         JWT_SECRET,
-        algorithm=JWT_ALGORITHM
+        algorithm=JWT_ALGORITHM,
     )
 
 
-def create_access_token(user: User):
-
-    # exactly 900 seconds
+def create_access_token(
+    user: User,
+) -> str:
     return _create_token(
         user,
         "access",
-        900
+        15 * 60,
     )
 
 
-def create_refresh_token(user: User):
-
-    # 7 days
+def create_refresh_token(
+    user: User,
+) -> str:
     return _create_token(
         user,
         "refresh",
-        7 * 24 * 60 * 60
+        7 * 24 * 60 * 60,
     )
 
 
-def decode_token(token: str):
-
+def decode_token(
+    token: str,
+) -> dict:
     try:
         return jwt.decode(
             token,
             JWT_SECRET,
-            algorithms=[JWT_ALGORITHM]
+            algorithms=[JWT_ALGORITHM],
         )
 
     except jwt.PyJWTError:
         raise AppError(
             401,
             "UNAUTHORIZED",
-            "Invalid or expired token"
+            "Invalid or expired token",
         )
 
 
-def revoke_access_token(payload: dict):
-
+def revoke_access_token(
+    payload: dict,
+) -> None:
     _revoked_access_tokens.add(
-        payload["jti"]
+        payload["jti"],
     )
 
 
-def revoke_refresh_token(payload: dict):
+def is_access_token_revoked(
+    payload: dict,
+) -> bool:
+    return (
+        payload["jti"]
+        in _revoked_access_tokens
+    )
 
+
+def revoke_refresh_token(
+    payload: dict,
+) -> None:
     _used_refresh_tokens.add(
-        payload["jti"]
+        payload["jti"],
     )
 
 
-def get_token_payload(request: Request):
+def is_refresh_token_used(
+    payload: dict,
+) -> bool:
+    return (
+        payload["jti"]
+        in _used_refresh_tokens
+    )
 
-    header = request.headers.get("Authorization")
 
-    if not header or not header.startswith("Bearer "):
+def get_token_payload(
+    request: Request,
+) -> dict:
+    authorization = request.headers.get(
+        "Authorization",
+    )
+
+    if (
+        authorization is None
+        or not authorization.startswith(
+            "Bearer "
+        )
+    ):
         raise AppError(
             401,
             "UNAUTHORIZED",
-            "Missing bearer token"
+            "Missing bearer token",
         )
 
-    token = header[len("Bearer "):].strip()
+    token = authorization[
+        len("Bearer "):
+    ].strip()
+
+    if not token:
+        raise AppError(
+            401,
+            "UNAUTHORIZED",
+            "Missing bearer token",
+        )
 
     payload = decode_token(token)
 
@@ -147,27 +200,48 @@ def get_token_payload(request: Request):
         raise AppError(
             401,
             "UNAUTHORIZED",
-            "Wrong token type"
+            "Wrong token type",
         )
 
-    if payload["jti"] in _revoked_access_tokens:
+    if is_access_token_revoked(payload):
         raise AppError(
             401,
             "UNAUTHORIZED",
-            "Token has been revoked"
+            "Token has been revoked",
         )
 
     return payload
 
 
 def get_current_user(
-    payload: dict = Depends(get_token_payload),
-    db: Session = Depends(get_db),
-):
+    payload: dict = Depends(
+        get_token_payload
+    ),
+    db: Session = Depends(
+        get_db
+    ),
+) -> User:
+    try:
+        user_id = int(
+            payload["sub"]
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        raise AppError(
+            401,
+            "UNAUTHORIZED",
+            "Invalid token payload",
+        )
 
     user = (
         db.query(User)
-        .filter(User.id == int(payload["sub"]))
+        .filter(
+            User.id == user_id,
+        )
         .first()
     )
 
@@ -175,21 +249,34 @@ def get_current_user(
         raise AppError(
             401,
             "UNAUTHORIZED",
-            "Unknown user"
+            "Unknown user",
+        )
+
+    if (
+        payload.get("org")
+        != user.org_id
+        or payload.get("role")
+        != user.role
+    ):
+        raise AppError(
+            401,
+            "UNAUTHORIZED",
+            "Invalid token payload",
         )
 
     return user
 
 
 def require_admin(
-    user: User = Depends(get_current_user)
-):
-
+    user: User = Depends(
+        get_current_user
+    ),
+) -> User:
     if user.role != "admin":
         raise AppError(
             403,
             "FORBIDDEN",
-            "Admin privileges required"
+            "Admin privileges required",
         )
 
     return user
